@@ -1,0 +1,340 @@
+From cf864d343f9fdb3d6dba2f22795de1f034b98d2a Mon Sep 17 00:00:00 2001
+From: Eugene Bogomazov <eb@highloadlab.com>
+Date: Wed, 13 Jun 2018 15:28:23 +0300
+Subject: [PATCH] Add realization of Open Policy to bird version 2.0.5
+
+---
+ proto/bgp/attrs.c   | 50 +++++++++++++++++++++++++++++++++++++++++++++
+ proto/bgp/bgp.c     | 25 +++++++++++++++++++++++
+ proto/bgp/bgp.h     | 17 +++++++++++++++
+ proto/bgp/config.Y  | 17 +++++++++++++--
+ proto/bgp/packets.c | 34 ++++++++++++++++++++++++++++++
+ 5 files changed, 141 insertions(+), 2 deletions(-)
+
+diff --git a/proto/bgp/attrs.c b/proto/bgp/attrs.c
+index 69c4b172..fde64941 100644
+--- a/proto/bgp/attrs.c
++++ b/proto/bgp/attrs.c
+@@ -230,6 +230,15 @@ bgp_format_origin(eattr *a, byte *buf, uint size UNUSED)
+   bsprintf(buf, (a->u.data <= 2) ? bgp_origin_names[a->u.data] : "?");
+ }
+ 
++static void
++bgp_decode_OTC(struct bgp_parse_state *s, uint code UNUSED, uint flags, byte *data UNUSED, uint len, ea_list **to)
++{
++  if (len != 4)
++    WITHDRAW(BAD_LENGTH, "OTC", len);
++
++  u32 val = get_u32(data);
++  bgp_set_attr_u32(to, s->pool, BA_ONLY_TO_CUSTOMER, flags, val);
++}
+ 
+ static int
+ bgp_encode_as_path(struct bgp_write_state *s, eattr *a, byte *buf, uint size)
+@@ -836,6 +845,13 @@ static const struct bgp_attr_desc bgp_attr_table[] = {
+     .decode = bgp_decode_mpls_label_stack,
+     .format = bgp_format_mpls_label_stack,
+   },
++  [BA_ONLY_TO_CUSTOMER] = {
++    .name = "OTC",
++    .type = EAF_TYPE_INT,
++    .flags = BAF_OPTIONAL | BAF_TRANSITIVE,
++    .encode = bgp_encode_u32,
++    .decode = bgp_decode_OTC,
++  },
+ };
+ 
+ static inline int
+@@ -1133,6 +1149,23 @@ bgp_decode_attrs(struct bgp_parse_state *s, byte *data, uint len)
+   if (!BIT32_TEST(s->attrs_seen, BA_LOCAL_PREF))
+     bgp_set_attr_u32(&attrs, s->pool, BA_LOCAL_PREF, 0, p->cf->default_local_pref);
+ 
++  /* Reject routes from down neighbors if they are leaked */
++  eattr *e = bgp_find_attr(attrs, BA_ONLY_TO_CUSTOMER);
++  if (e &&
++       (p->cf->local_role == ROLE_PROV ||
++        p->cf->local_role == ROLE_RS_S))
++    goto withdraw;
++
++  if (e && e->u.data != p->cf->remote_as && p->cf->local_role == ROLE_PEER)
++    goto withdraw;
++
++  /* Mark routes from up neighbors if it doesn't happened before */
++  if (!BIT32_TEST(s->attrs_seen, BA_ONLY_TO_CUSTOMER) &&
++       (p->cf->local_role == ROLE_CUST ||
++        p->cf->local_role == ROLE_PEER ||
++        p->cf->local_role == ROLE_RS_C))
++    bgp_set_attr_u32(&attrs, s->pool, BA_ONLY_TO_CUSTOMER, 0, p->cf->remote_as);
++
+   return attrs;
+ 
+ 
+@@ -1423,6 +1456,14 @@ bgp_preexport(struct proto *P, rte **new, struct linpool *pool UNUSED)
+       return -1;
+   }
+ 
++  /* Do not export routes which are marked with OTC */
++  c = ea_find(e->attrs->eattrs, EA_CODE(PROTOCOL_BGP, BA_ONLY_TO_CUSTOMER));
++  if (c &&
++      (p->cf->local_role==ROLE_CUST ||
++       p->cf->local_role==ROLE_PEER ||
++       p->cf->local_role==ROLE_RS_C))
++    return -1;
++
+   return 0;
+ }
+ 
+@@ -1522,6 +1563,15 @@ bgp_update_attrs(struct bgp_proto *p, struct bgp_channel *c, rte *e, ea_list *at
+     }
+   }
+ 
++  /* Mark routes with OTC to the down directions */
++  a = bgp_find_attr(attrs, BA_ONLY_TO_CUSTOMER);
++  if (! a) {
++    if (p->cf->local_role == ROLE_PROV ||
++        p->cf->local_role == ROLE_PEER ||
++        p->cf->local_role == ROLE_RS_S)
++      bgp_set_attr_u32(&attrs, pool, BA_ONLY_TO_CUSTOMER, 0, p->local_as);
++  }
++
+   /*
+    * Presence of mandatory attributes ORIGIN and AS_PATH is ensured by above
+    * conditions. Presence and validity of quasi-mandatory NEXT_HOP attribute
+diff --git a/proto/bgp/bgp.c b/proto/bgp/bgp.c
+index 5a403b40..0a5c8933 100644
+--- a/proto/bgp/bgp.c
++++ b/proto/bgp/bgp.c
+@@ -1904,6 +1904,17 @@ bgp_postconfig(struct proto_config *CF)
+   if (internal && cf->rs_client)
+     cf_error("Only external neighbor can be RS client");
+ 
++  if (internal &&
++        (cf->local_role==ROLE_PEER ||
++         cf->local_role==ROLE_CUST ||
++         cf->local_role==ROLE_PROV ||
++         cf->local_role==ROLE_RS_C ||
++         cf->local_role==ROLE_RS_S))
++    cf_error("Role peer, customer, provider and with RS may be set only on external connection");
++
++  if (cf->strict_mode && cf->local_role==ROLE_UNDE)
++    cf_error("Role must be set during strict mode");
++
+   if (!cf->confederation && cf->confederation_member)
+     cf_error("Confederation ID must be set for member sessions");
+ 
+@@ -2221,6 +2232,17 @@ bgp_show_afis(int code, char *s, u32 *afis, uint count)
+   cli_msg(code, b.start);
+ }
+ 
++
++static const char *
++bgp_format_role_name(u8 role)
++{
++  static const char *bgp_role_names[] = { "peer", "provider", "customer", "internal", "rs_server", "rs_client" };
++  if (role == ROLE_UNDE) return "undefine";
++  if (role <= 5) return bgp_role_names[role];
++  return "?";
++}
++
++
+ static void
+ bgp_show_capabilities(struct bgp_proto *p UNUSED, struct bgp_caps *caps)
+ {
+@@ -2346,6 +2368,9 @@ bgp_show_capabilities(struct bgp_proto *p UNUSED, struct bgp_caps *caps)
+     bgp_show_afis(-1006, "        AF supported:", afl1, afn1);
+     bgp_show_afis(-1006, "        AF preserved:", afl2, afn2);
+   }
++
++  if (caps->role != ROLE_UNDE)
++    cli_msg(-1006, "      Role %s", bgp_format_role_name(caps->role));
+ }
+ 
+ static void
+diff --git a/proto/bgp/bgp.h b/proto/bgp/bgp.h
+index 075e1bb9..e4088ba5 100644
+--- a/proto/bgp/bgp.h
++++ b/proto/bgp/bgp.h
+@@ -110,6 +110,8 @@ struct bgp_config {
+   int gr_mode;				/* Graceful restart mode (BGP_GR_*) */
+   int llgr_mode;			/* Long-lived graceful restart mode (BGP_LLGR_*) */
+   int setkey;				/* Set MD5 password to system SA/SP database */
++  u8  local_role;			/* Set peering role with neighbor */
++  int strict_mode;			/* Is setting role on both sides is mandatory */
+   /* Times below are in seconds */
+   unsigned gr_time;			/* Graceful restart timeout */
+   unsigned llgr_time;			/* Long-lived graceful restart stale time */
+@@ -159,6 +161,18 @@ struct bgp_channel_config {
+ #define BGP_PT_INTERNAL		1
+ #define BGP_PT_EXTERNAL		2
+ 
++#define ROLE_UNDE 		255
++#define ROLE_PROV 		0
++#define ROLE_RS_S 		1
++#define ROLE_RS_C 		2
++#define ROLE_CUST 		3
++#define ROLE_PEER 		4
++#define ROLE_MAX  		5
++
++#define MLL_SELF 1
++#define MLL_DROP 2
++#define MLL_IGNORE 3
++
+ #define NH_NO			0
+ #define NH_ALL			1
+ #define NH_IBGP			2
+@@ -215,6 +229,7 @@ struct bgp_caps {
+   u8 ext_messages;			/* Extended message length,  RFC draft */
+   u8 route_refresh;			/* Route refresh capability, RFC 2918 */
+   u8 enhanced_refresh;			/* Enhanced route refresh,   RFC 7313 */
++  u8 role;				/* BGP role capability,      RFC draft */
+ 
+   u8 gr_aware;				/* Graceful restart capability, RFC 4724 */
+   u8 gr_flags;				/* Graceful restart flags */
+@@ -260,6 +275,7 @@ struct bgp_conn {
+   u8 last_channel_count;		/* Number of times the last channel was used in succession */
+   int notify_code, notify_subcode, notify_size;
+   byte *notify_data;
++  u8 neighbor_role;
+ 
+   uint hold_time, keepalive_time;	/* Times calculated from my and neighbor's requirements */
+ };
+@@ -611,6 +627,7 @@ void bgp_update_next_hop(struct bgp_export_state *s, eattr *a, ea_list **to);
+ #define BA_AS4_PATH             0x11	/* RFC 6793 */
+ #define BA_AS4_AGGREGATOR       0x12	/* RFC 6793 */
+ #define BA_LARGE_COMMUNITY	0x20	/* RFC 8092 */
++#define BA_ONLY_TO_CUSTOMER	0x23	/* RFC draft */
+ 
+ /* Bird's private internal BGP attributes */
+ #define BA_MPLS_LABEL_STACK	0xfe	/* MPLS label stack transfer attribute */
+diff --git a/proto/bgp/config.Y b/proto/bgp/config.Y
+index bbc7d9a4..bd97553d 100644
+--- a/proto/bgp/config.Y
++++ b/proto/bgp/config.Y
+@@ -30,7 +30,8 @@ CF_KEYWORDS(BGP, LOCAL, NEIGHBOR, AS, HOLD, TIME, CONNECT, RETRY, KEEPALIVE,
+ 	GRACEFUL, RESTART, AWARE, CHECK, LINK, PORT, EXTENDED, MESSAGES, SETKEY,
+ 	STRICT, BIND, CONFEDERATION, MEMBER, MULTICAST, FLOW4, FLOW6, LONG,
+ 	LIVED, STALE, IMPORT, IBGP, EBGP, MANDATORY, INTERNAL, EXTERNAL,
+-	DYNAMIC, RANGE, NAME, DIGITS)
++	DYNAMIC, RANGE, NAME, DIGITS, LOCAL_ROLE, PEER, PROVIDER, CUSTOMER,
++	RS_SERVER, RS_CLIENT, STRICT_MODE)
+ 
+ %type <i> bgp_nh
+ %type <i32> bgp_afi
+@@ -39,7 +40,7 @@ CF_KEYWORDS(CEASE, PREFIX, LIMIT, HIT, ADMINISTRATIVE, SHUTDOWN, RESET, PEER,
+ 	CONFIGURATION, CHANGE, DECONFIGURED, CONNECTION, REJECTED, COLLISION,
+ 	OUT, OF, RESOURCES)
+ 
+-%type<i> bgp_cease_mask bgp_cease_list bgp_cease_flag
++%type<i> bgp_cease_mask bgp_cease_list bgp_cease_flag bgp_role_name
+ 
+ CF_GRAMMAR
+ 
+@@ -71,6 +72,8 @@ bgp_proto_start: proto_start BGP {
+      BGP_CFG->setkey = 1;
+      BGP_CFG->dynamic_name = "dynbgp";
+      BGP_CFG->check_link = -1;
++     BGP_CFG->local_role = ROLE_UNDE;
++     BGP_CFG->strict_mode = 0;
+    }
+  ;
+ 
+@@ -111,6 +114,14 @@ bgp_cease_flag:
+  | OUT OF RESOURCES		{ $$ = 1 << 8; }
+  ;
+ 
++bgp_role_name:
++   PEER      { $$ = ROLE_PEER; }
++ | PROVIDER  { $$ = ROLE_PROV; }
++ | CUSTOMER  { $$ = ROLE_CUST; }
++ | RS_SERVER { $$ = ROLE_RS_S; }
++ | RS_CLIENT { $$ = ROLE_RS_C; }
++ ;
++
+ bgp_proto:
+    bgp_proto_start proto_name '{'
+  | bgp_proto proto_item ';'
+@@ -189,6 +200,8 @@ bgp_proto:
+  | bgp_proto CHECK LINK bool ';' { BGP_CFG->check_link = $4; }
+  | bgp_proto BFD bool ';' { BGP_CFG->bfd = $3; cf_check_bfd($3); }
+  | bgp_proto BFD GRACEFUL ';' { BGP_CFG->bfd = BGP_BFD_GRACEFUL; cf_check_bfd(1); }
++ | bgp_proto LOCAL_ROLE bgp_role_name ';' { BGP_CFG->local_role = $3; }
++ | bgp_proto STRICT_MODE ';' { BGP_CFG->strict_mode = 1; }
+  ;
+ 
+ bgp_afi:
+diff --git a/proto/bgp/packets.c b/proto/bgp/packets.c
+index daa88630..ab39fa0d 100644
+--- a/proto/bgp/packets.c
++++ b/proto/bgp/packets.c
+@@ -232,6 +232,7 @@ bgp_prepare_capabilities(struct bgp_conn *conn)
+   caps->ext_messages = p->cf->enable_extended_messages;
+   caps->route_refresh = p->cf->enable_refresh;
+   caps->enhanced_refresh = p->cf->enable_refresh;
++  caps->role = p->cf->local_role;
+ 
+   if (caps->as4_support)
+     caps->as4_number = p->public_as;
+@@ -336,6 +337,14 @@ bgp_write_capabilities(struct bgp_conn *conn, byte *buf)
+     *buf++ = 0;			/* Capability data length */
+   }
+ 
++  if (caps->role != ROLE_UNDE)
++  {
++    *buf++ = 9;			/* Capability 9: Announce choosen BGP role */
++    *buf++ = 1;			/* Capability data length */
++    buf[0] = caps->role;
++    buf += 1;
++  }
++
+   if (caps->gr_aware)
+   {
+     *buf++ = 64;		/* Capability 64: Support for graceful restart */
+@@ -472,6 +481,14 @@ bgp_read_capabilities(struct bgp_conn *conn, struct bgp_caps *caps, byte *pos, i
+       caps->ext_messages = 1;
+       break;
+ 
++    case  9: /* Roles capability, RFC draft */
++      if (cl != 1)
++        goto err;
++
++      caps->role = pos[2];
++      conn->neighbor_role = caps->role;
++      break;
++
+     case 64: /* Graceful restart capability, RFC 4724 */
+       if (cl % 4 != 2)
+ 	goto err;
+@@ -631,6 +648,9 @@ bgp_read_options(struct bgp_conn *conn, byte *pos, int len)
+   caps = alloca(sizeof(struct bgp_caps) + 64 * sizeof(struct bgp_af_caps));
+   memset(caps, 0, sizeof(struct bgp_caps));
+ 
++  caps->role = ROLE_UNDE;
++  conn->neighbor_role = ROLE_UNDE;
++
+   while (len > 0)
+   {
+     if ((len < 2) || (len < (2 + pos[1])))
+@@ -754,6 +774,20 @@ bgp_rx_open(struct bgp_conn *conn, byte *pkt, uint len)
+     conn->received_as = asn;
+   }
+ 
++  u8 neigh_role = conn->neighbor_role;
++  u8 local_role = p->cf->local_role;
++
++  if ((neigh_role != ROLE_UNDE) && (neigh_role < ROLE_MAX) && (local_role != ROLE_UNDE) && !(
++                                (local_role == ROLE_CUST && neigh_role == ROLE_PROV) ||
++                                (local_role == ROLE_PROV && neigh_role == ROLE_CUST) ||
++                                (local_role == ROLE_RS_C && neigh_role == ROLE_RS_S) ||
++                                (local_role == ROLE_RS_S && neigh_role == ROLE_RS_C)))
++
++      { bgp_error(conn, 2, 8, NULL, 0); return; }
++
++  if ((p->cf->strict_mode) && (neigh_role == ROLE_UNDE))
++      { bgp_error(conn, 6, 5, NULL, 0); return; }
++
+   /* Check the other connection */
+   other = (conn == &p->outgoing_conn) ? &p->incoming_conn : &p->outgoing_conn;
+   switch (other->state)
+-- 
+2.17.1
+
