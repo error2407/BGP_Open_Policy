@@ -15,8 +15,22 @@ To use new functionality add the following lines in the config:
 ```
 protocol bgp {
   ...
-  local role provider;
+  local_role provider;
   strict_mode;
 }
 ```
-where other possible **local role** values are: *provider*, *customer*, *peer*, *rs_client* (for IX members) and *rs_server* (for RS themselves).
+where other possible **local_role** values are: *provider*, *customer*, *peer*, *rs_client* (for IX members) and *rs_server* (for RS themselves).
+
+## FRR
+Source code with patch can be find in https://github.com/error2407/frr
+
+### Usage
+To use new functionality use the following sintax:
+
+```
+neighbor <A.B.C.D|X:X::X:X|WORD> local-role <peer|provider|customer|rs-server|rs-client>
+```
+or
+```
+neighbor <A.B.C.D|X:X::X:X|WORD> local-role <peer|provider|customer|rs-server|rs-client> strict-mode
+```
